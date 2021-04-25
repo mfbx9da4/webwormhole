@@ -1,4 +1,65 @@
 "use strict";
+
+const matchMessage = (type, rawMessage) => {
+  if (!type) return true
+  let parsed
+  try {
+	parsed = JSON.parse(rawMessage)
+  } catch (e) {}
+  return parsed?.data?.type === type
+}
+
+const wait = async (ws, type, timeout) => {
+  return new Promise((resolve) => {
+	let timeoutID
+	if (timeout) {
+	  timeoutID = setTimeout(() => {
+		cleanup()
+		resolve([undefined, new Error('TimeoutError')])
+	  }, timeout)
+	}
+
+	const listener = (rawMessage) => {
+	  if (matchMessage(type, rawMessage)) {
+		clearTimeout(timeoutID)
+		cleanup()
+		resolve([rawMessage])
+	  }
+	}
+
+	const errorListener = (error) => {
+	  cleanup()
+	  resolve([undefined, error])
+	}
+
+	const cleanup = () => {
+	  ws.removeEventListener('message', listener)
+	  ws.removeEventListener('error', errorListener)
+	}
+
+	ws.addEventListener('message', listener)
+	ws.addEventListener('error', errorListener)
+  })
+}
+
+const createDeferredPromise = () => {
+  let ret = { isPending: true, isFulfilled: false, isRejected: false }
+  ret.promise = new Promise((res, rej) => {
+	ret.resolve = (...args) => {
+	  ret.isPending = false
+	  ret.isFulfilled = true
+	  res(...args)
+	}
+	ret.reject = (...args) => {
+	  ret.isPending = false
+	  ret.isRejected = true
+	  rej(...args)
+	}
+  })
+  return ret
+}
+
+
 class Wormhole {
 	constructor(signalserver, code) {
 		this.protocol = "4"; // safari has no static fields
@@ -14,37 +75,27 @@ class Wormhole {
 		//        can display the key fingerprint.
 		//   4. (unimplemented) caller tells us the webrtc handshake is done.
 		//        We can close the websocket.
-		this.promise1 = new Promise((resolve1, reject1) => {
-			this.promise2 = new Promise((resolve2, reject2) => {
-				this.promise3 = new Promise((resolve3, reject3) => {
-					// It is very possible that I do not understand how to us promises "correctly".
-					this.resolve1 = resolve1;
-					this.reject1 = reject1;
-					this.resolve2 = resolve2;
-					this.reject2 = reject2;
-					this.resolve3 = resolve3;
-					this.reject3 = reject3;
-					this.dial(signalserver, code);
-				});
-			});
-		});
+		this.phase1 = createDeferredPromise();
+		this.phase2 = createDeferredPromise();
+		this.phase3 = createDeferredPromise();
+		this.dial(signalserver, code);
 	}
 
 	async signal() {
-		return this.promise1;
+		return this.phase1.promise;
 	}
 
 	async finish() {
-		this.resolve2();
-		return this.promise3;
+		this.phase2.resolve();
+		return this.phase3.promise;
 	}
 
 	dial(signalserver, code) {
-		if (code !== "") {
+		const hasCode = Boolean(code)
+		
+		if (hasCode) {
 			[this.slot, this.pass] = webwormhole.decode(code);
-			if (this.pass.length === 0) {
-				throw "bad code";
-			}
+			if (this.pass.length === 0) throw "bad code"
 			console.log("dialling slot:", this.slot);
 			this.state = "b";
 		} else {
@@ -53,6 +104,7 @@ class Wormhole {
 			console.log("requesting slot");
 			this.state = "a";
 		}
+		
 		this.ws = new WebSocket(
 			Wormhole.wsserver(signalserver, this.slot),
 			this.protocol,
@@ -60,168 +112,166 @@ class Wormhole {
 		this.ws.onopen = (a) => {
 			this.onopen(a);
 		};
+		
 		this.ws.onerror = (a) => {
 			this.onerror(a);
 		};
 		this.ws.onclose = (a) => {
 			this.onclose(a);
 		};
-		this.ws.onmessage = (a) => {
-			this.onmessage(a);
-		};
+
+		if (hasCode) return this.join()
+		return this.new()
 	}
 
-	onmessage(m) {
-		let msg; // for decoded json
+	async new() {
+		await this.waitForSlotA()
+		await this.waitForPakeA()
+		await this.waitForPcInitialize()
+		await this.createOffer()
+		await this.waitForWebRtcAnswer()
+		await this.waitForCandidates()
+	}
 
-		// This all being so asynchronous makes it so the only way apparent to
-		// me to describe the PAKE and WebRTC message exchange state machine
-		// a big case statement. I'd welcome a clearer or more idiomatic approach
-		// in JS if someone were to suggest one.
-		switch (this.state) {
-			case "a": {
-				msg = JSON.parse(m.data);
-				console.log("assigned slot:", msg.slot);
-				this.slot = parseInt(msg.slot, 10);
-				if (!Number.isSafeInteger(this.slot)) {
-					this.fail("invalid slot");
-					return;
-				}
-				this.newPeerConnection(msg.iceServers);
-				this.resolve1({
-					code: webwormhole.encode(this.slot, this.pass),
-					pc: this.pc,
-				});
-				this.state = "wait_for_pake_a";
-				return;
-			}
+	async join() {
+		await this.waitForSlotB()
+		await this.waitForPakeB()
+		await this.waitForWebRtcOffer()
+		await this.waitForPcInitialize()
+		await this.createAnswer()
+		await this.waitForCandidates()
+	}
+	
 
-			case "b": {
-				msg = JSON.parse(m.data);
-				this.newPeerConnection(msg.iceServers);
-				this.resolve1({
-					pc: this.pc,
-				});
-				const msgA = webwormhole.start(this.pass);
-				if (msgA == null) {
-					this.fail("couldn't generate A's PAKE message");
-					return;
-				}
-				console.log("message a:", msgA);
-				this.ws.send(msgA);
-				this.state = "wait_for_pake_b";
-				return;
-			}
+	async waitForSlotA() {
+		const [rawMessage, error] = await wait(this.ws)
+		if (error) return
+		const msg = JSON.parse(rawMessage.data)
+		console.log('assigned slot:', msg.slot)
+		this.slot = parseInt(msg.slot, 10)
+		if (!Number.isSafeInteger(this.slot)) return this.fail('invalid slot')
 
-			case "wait_for_pake_a": {
-				console.log("got pake message a:", m.data);
-				let msgB;
-				[this.key, msgB] = webwormhole.exchange(this.pass, m.data);
-				console.log("message b:", msgB);
-				if (this.key == null) {
-					this.fail("could not generate key");
-					return;
-				}
-				console.log("generated key");
-				this.ws.send(msgB);
-				this.state = "wait_for_pc_initialize";
-				this.promise2.then(async () => {
-					const offer = await this.pc.createOffer();
-					console.log("created offer");
-					this.ws.send(webwormhole.seal(this.key, JSON.stringify(offer)));
-					this.state = "wait_for_webtc_answer";
-					this.pc.setLocalDescription(offer);
-				});
-				return;
-			}
+		this.newPeerConnection(msg.iceServers)
+		
+		const code = webwormhole.encode(this.slot, this.pass)
+		this.phase1.resolve({ code, pc: this.pc })
+		this.state = 'wait_for_pake_a'
+	}
+	
+	
+	async waitForPakeA() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		console.log('got pake message a:', m.data)
+		const [key, msgB] = webwormhole.exchange(this.pass, m.data)
+		this.key = key
+		console.log('message b:', msgB)
+		if (this.key === null) return this.fail('could not generate key')
+		console.log('generated key')
+		this.ws.send(msgB)
+		this.state = 'wait_for_pc_initialize'
+	}
 
-			case "wait_for_pake_b": {
-				console.log("got pake message b:", m.data);
-				this.key = webwormhole.finish(m.data);
-				if (this.key == null) {
-					this.fail("could not generate key");
-					return;
-				}
-				console.log("generated key");
-				this.state = "wait_for_webtc_offer";
-				return;
-			}
+	async waitForPcInitialize() {
+		await this.phase2.promise
+	}
 
-			case "wait_for_webtc_offer": {
-				msg = JSON.parse(webwormhole.open(this.key, m.data));
-				if (msg == null) {
-					this.fail("bad key");
-					this.ws.send(webwormhole.seal(this.key, "bye"));
-					this.ws.close();
-					return;
-				}
-				if (msg.type !== "offer") {
-					console.log("unexpected message", msg);
-					this.fail("unexpected message");
-					return;
-				}
-				console.log("got offer");
-				// No intermediate state wait_for_pc_initialize because candidates can
-				// staring arriving straight after the offer is sent.
-				this.state = "wait_for_candidates";
-				this.promise2.then(async () => {
-					await this.pc.setRemoteDescription(new RTCSessionDescription(msg));
-					const answer = await this.pc.createAnswer();
-					console.log("created answer");
-					this.ws.send(webwormhole.seal(this.key, JSON.stringify(answer)));
-					this.resolve3(webwormhole.fingerprint(this.key));
-					this.pc.setLocalDescription(answer);
-				});
-				return;
-			}
-
-			case "wait_for_webtc_answer": {
-				msg = JSON.parse(webwormhole.open(this.key, m.data));
-				if (msg == null) {
-					this.fail("bad key");
-					this.ws.send(webwormhole.seal(this.key, "bye"));
-					this.ws.close();
-					return;
-				}
-				if (msg.type !== "answer") {
-					console.log("unexpected message", msg);
-					this.fail("unexpected message");
-					return;
-				}
-				console.log("got answer");
-				this.pc.setRemoteDescription(new RTCSessionDescription(msg));
-				this.resolve3(webwormhole.fingerprint(this.key));
-				this.state = "wait_for_candidates";
-				return;
-			}
-
-			case "wait_for_candidates": {
-				msg = JSON.parse(webwormhole.open(this.key, m.data));
-				if (msg == null) {
-					this.fail("bad key");
-					this.ws.send(webwormhole.seal(this.key, "bye"));
-					this.ws.close();
-					return;
-				}
-				console.log("got remote candidate", msg);
-				this.promise2.then(async () => {
-					this.pc.addIceCandidate(new RTCIceCandidate(msg));
-				});
-				return;
-			}
-
-			case "wait_for_pc_initialize":
-			case "wait_for_local_offer":
-			case "wait_for_local_answer": {
-				console.log("unexpected message", m);
-				this.fail("unexpected message");
-				return;
-			}
-			case "error":
-				return;
+	async createOffer() {
+		const offer = await this.pc.createOffer()
+		console.log('created offer')
+		await this.pc.setLocalDescription(offer)
+		this.ws.send(webwormhole.seal(this.key, JSON.stringify(offer)))
+		this.state = 'wait_for_webtc_answer'
+	}
+	
+	async waitForWebRtcAnswer() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		const msg = JSON.parse(webwormhole.open(this.key, m.data))
+		if (msg == null) {
+			this.fail('bad key')
+			this.ws.send(webwormhole.seal(this.key, 'bye'))
+			return this.ws.close()
 		}
+		if (msg.type !== 'answer') {
+			console.log('unexpected message', msg)
+			return this.fail('unexpected message')
+		}
+		console.log('got answer')
+		await this.pc.setRemoteDescription(new RTCSessionDescription(msg))
+		this.phase3.resolve(webwormhole.fingerprint(this.key))
+		this.state = 'wait_for_candidates'
 	}
 
+	async waitForCandidates() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		const msg = JSON.parse(webwormhole.open(this.key, m.data))
+		if (msg == null) {
+			this.fail('bad key')
+			this.ws.send(webwormhole.seal(this.key, 'bye'))
+			this.ws.close()
+			return
+		}
+		console.log('got remote candidate', msg)
+		return this.pc.addIceCandidate(new RTCIceCandidate(msg))
+	}
+
+	async waitForSlotB() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		const msg = JSON.parse(m.data)
+		this.newPeerConnection(msg.iceServers)
+		this.phase1.resolve({ pc: this.pc })
+		const msgA = webwormhole.start(this.pass)
+		if (msgA == null) return this.fail("couldn't generate A's PAKE message")
+			
+		console.log('message a:', msgA)
+		this.ws.send(msgA)
+		this.state = 'wait_for_pake_b'
+	}
+
+	async waitForPakeB() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		console.log('got pake message b:', m.data)
+		this.key = webwormhole.finish(m.data)
+		if (this.key == null) return this.fail('could not generate key')
+		console.log('generated key')
+		this.state = 'wait_for_webtc_offer'
+	}
+
+	async waitForWebRtcOffer() {
+		const [m, error] = await wait(this.ws)
+		if (error) return
+		const msg = JSON.parse(webwormhole.open(this.key, m.data))
+		if (msg == null) {
+			this.fail('bad key')
+			this.ws.send(webwormhole.seal(this.key, 'bye'))
+			return this.ws.close()
+		}
+
+		if (msg.type !== 'offer') {
+			console.log('unexpected message', msg)
+			return this.fail('unexpected message')
+		}
+		console.log('got offer')
+		// No intermediate state wait_for_pc_initialize because candidates can
+		// start arriving straight after the offer is sent.
+		// TODO: the above comment doesn't align as we do still wait for promise2?
+		this.remoteDescription = msg
+	}
+	
+	async createAnswer() {
+		await this.pc.setRemoteDescription(new RTCSessionDescription(this.remoteDescription))
+		const answer = await this.pc.createAnswer()
+		await this.pc.setLocalDescription(answer)
+		console.log('created answer')
+		this.phase3.resolve(webwormhole.fingerprint(this.key))
+		this.ws.send(webwormhole.seal(this.key, JSON.stringify(answer)))
+		this.state = 'wait_for_candidates'
+	}
+	
 	newPeerConnection(iceServers) {
 		let normalisedICEServers = [];
 		for (let i = 0; i < iceServers.length; i++) {
@@ -231,9 +281,7 @@ class Wormhole {
 				credential: iceServers[i].Credential,
 			});
 		}
-		this.pc = new RTCPeerConnection({
-			iceServers: normalisedICEServers,
-		});
+		this.pc = new RTCPeerConnection({ iceServers: normalisedICEServers });
 		this.pc.onicecandidate = (e) => {
 			if (e.candidate && e.candidate.candidate !== "") {
 				console.log("got local candidate", e.candidate);
@@ -250,7 +298,10 @@ class Wormhole {
 
 	onerror(e) {
 		console.log("websocket session error:", e);
-		this.fail("could not connect to signalling server");
+		const msg = 'could not connect to signalling server'
+		this.fail(msg);
+		if (this.phase1.isPending) this.phase1.reject(msg)
+		if (this.phase3.isPending) this.phase3.reject(msg)
 	}
 
 	onclose(e) {
@@ -276,8 +327,8 @@ class Wormhole {
 	}
 
 	fail(reason) {
-		this.reject1(reason);
-		this.reject3(reason);
+		if (this.phase1.isPending) this.phase1.reject(reason)
+    	if (this.phase3.isPending) this.phase3.reject(reason)
 		this.state = "error";
 	}
 
